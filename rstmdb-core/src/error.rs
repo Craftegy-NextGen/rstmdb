@@ -38,6 +38,9 @@ pub enum CoreError {
     #[error("invalid guard expression: {reason}")]
     InvalidGuard { reason: String },
 
+    #[error("invalid context: {reason}")]
+    InvalidContext { reason: String },
+
     #[error("WAL error: {0}")]
     Wal(#[from] rstmdb_wal::WalError),
 
@@ -65,6 +68,7 @@ impl CoreError {
             CoreError::WalOffsetConflict { .. } => "CONFLICT",
             CoreError::InvalidDefinition { .. } => "BAD_REQUEST",
             CoreError::InvalidGuard { .. } => "BAD_REQUEST",
+            CoreError::InvalidContext { .. } => "BAD_REQUEST",
             CoreError::Wal(_) => "WAL_IO_ERROR",
             CoreError::Json(_) => "BAD_REQUEST",
         }

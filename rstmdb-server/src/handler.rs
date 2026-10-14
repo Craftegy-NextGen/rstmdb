@@ -39,6 +39,9 @@ impl Default for ServerInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![
                 "idempotency".to_string(),
+                // Idempotency keys survive restarts and WAL compaction, and
+                // CREATE_INSTANCE honors them.
+                "durable_idempotency".to_string(),
                 "batch".to_string(),
                 "wal_read".to_string(),
             ],
@@ -185,16 +188,33 @@ impl CommandHandler {
         snapshot_dir: impl AsRef<Path>,
         auth_config: &AuthConfig,
     ) -> Result<Self, ServerError> {
-        let snapshot_store = SnapshotStore::open(snapshot_dir)?;
+        let snapshot_store = Arc::new(SnapshotStore::open(snapshot_dir)?);
+        Ok(Self::with_snapshot_store_and_auth(
+            engine,
+            snapshot_store,
+            auth_config,
+        ))
+    }
+
+    /// Creates a command handler sharing an already-open snapshot store.
+    ///
+    /// The server must use a single `SnapshotStore` per data directory: each
+    /// store keeps its own in-memory index and rewrites `index.json`, so two
+    /// stores on one directory would overwrite each other's entries.
+    pub fn with_snapshot_store_and_auth(
+        engine: Arc<StateMachineEngine>,
+        snapshot_store: Arc<SnapshotStore>,
+        auth_config: &AuthConfig,
+    ) -> Self {
         let token_validator = if auth_config.required && !auth_config.token_hashes.is_empty() {
             Some(TokenValidator::new(auth_config.token_hashes.clone()))
         } else {
             None
         };
 
-        Ok(Self {
+        Self {
             engine,
-            snapshot_store: Some(Arc::new(snapshot_store)),
+            snapshot_store: Some(snapshot_store),
             info: ServerInfo::default(),
             token_validator,
             auth_required: auth_config.required,
@@ -207,7 +227,7 @@ impl CommandHandler {
             replica_client: OnceLock::new(),
             backup_registry: Arc::new(BackupRegistry::new()),
             compaction_gate: OnceLock::new(),
-        })
+        }
     }
 
     /// Creates a new command handler with custom server info.
@@ -969,6 +989,14 @@ impl CommandHandler {
     }
 
     fn handle_snapshot_instance(&self, params: &Value) -> Result<Value, ServerError> {
+        // Not a WAL write (so not in `is_write_operation`, which also drives the
+        // sync-replication wait), but replicas must not persist snapshots: their
+        // instance offsets are the primary's, and recovery after promotion would
+        // compare them against the local WAL.
+        if self.read_only {
+            return Err(ServerError::ReadOnlyMode);
+        }
+
         let instance_id = params["instance_id"]
             .as_str()
             .ok_or_else(|| ServerError::InvalidRequest("missing instance_id".to_string()))?;
@@ -978,7 +1006,8 @@ impl CommandHandler {
 
         // If we have a snapshot store, persist the snapshot
         if let Some(store) = &self.snapshot_store {
-            let snapshot = InstanceSnapshot::from_instance(&instance, &snapshot_id);
+            let snapshot = InstanceSnapshot::from_instance(&instance, &snapshot_id)
+                .with_idempotency(self.engine.idempotency_records(instance_id));
             let meta = store.create_snapshot(&snapshot)?;
 
             Ok(json!({
@@ -1094,46 +1123,21 @@ impl CommandHandler {
             ServerError::InvalidRequest("snapshot store not configured".to_string())
         })?;
 
-        let mut snapshots_created = 0;
-
         // Hold the shared gate (if any) for the duration of the snapshot +
         // compact pass so hot-backup staging can't observe a WAL/snapshot
         // mid-mutate. Mirrors CompactionManager::run_compaction.
         let _held = self.compaction_gate.get().map(|g| g.lock());
 
-        // Snapshot instances that have changed since last snapshot
-        for instance in self.engine.get_all_instances() {
-            let needs_snapshot = if force_snapshot {
-                // Check if instance changed since last snapshot
-                match snapshot_store.get_snapshot_meta(&instance.id) {
-                    Some(meta) => instance.last_wal_offset > meta.wal_offset,
-                    None => true, // No snapshot exists
-                }
-            } else {
-                // Only snapshot if no snapshot exists
-                snapshot_store.get_snapshot_meta(&instance.id).is_none()
-            };
-
-            if needs_snapshot {
-                let snapshot_id = format!("snap-{}", uuid::Uuid::new_v4());
-                let snapshot = InstanceSnapshot::from_instance(&instance, snapshot_id);
-                snapshot_store.create_snapshot(&snapshot)?;
-                snapshots_created += 1;
-            }
-        }
-
-        // Compact WAL segments before the minimum snapshot offset
-        // Only segments that are ENTIRELY before min_offset can be deleted
-        let (segments_deleted, bytes_reclaimed) =
-            if let Some(min_offset) = snapshot_store.min_wal_offset() {
-                let wal = self.engine.wal();
-                let deleted = wal.compact_before(rstmdb_wal::WalOffset::from_u64(min_offset))?;
-                // Estimate bytes reclaimed (segment_size * deleted_count)
-                let bytes = (deleted as u64) * 64 * 1024 * 1024; // Approximate
-                (deleted, bytes)
-            } else {
-                (0, 0)
-            };
+        let mode = if force_snapshot {
+            crate::compaction::SnapshotMode::Changed
+        } else {
+            crate::compaction::SnapshotMode::MissingOnly
+        };
+        let pass = crate::compaction::snapshot_and_compact(&self.engine, snapshot_store, mode)?;
+        let snapshots_created = pass.snapshots_created;
+        let segments_deleted = pass.segments_deleted;
+        // Estimate bytes reclaimed (segment_size * deleted_count)
+        let bytes_reclaimed = (segments_deleted as u64) * 64 * 1024 * 1024; // Approximate
         drop(_held);
 
         // Report current state
@@ -2601,6 +2605,45 @@ mod tests {
         let response = handler.handle(&mut session, &request);
         assert!(response.is_error());
         assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+    }
+
+    /// A replica's instance offsets are the primary's, not its local WAL's, so a
+    /// snapshot persisted there would mislead recovery after promotion.
+    #[test]
+    fn test_read_only_rejects_snapshot_instance() {
+        let dir = TempDir::new().unwrap();
+        let config = WalConfig::new(dir.path().join("wal"))
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let engine = Arc::new(StateMachineEngine::new(config).unwrap());
+        engine
+            .put_machine(
+                "m",
+                1,
+                &json!({"states": ["a"], "initial": "a", "transitions": []}),
+            )
+            .unwrap();
+        engine
+            .create_instance("i-1", "m", 1, json!({}), None)
+            .unwrap();
+
+        let snapshot_dir = dir.path().join("snapshots");
+        let store = Arc::new(SnapshotStore::open(&snapshot_dir).unwrap());
+        let handler = CommandHandler::with_snapshot_store_and_auth(
+            engine,
+            store.clone(),
+            &AuthConfig::default(),
+        )
+        .with_read_only(true);
+        let mut session = test_session();
+
+        let request = Request::new("1", Operation::SnapshotInstance)
+            .with_params(json!({"instance_id": "i-1"}));
+        let response = handler.handle(&mut session, &request);
+
+        assert!(response.is_error());
+        assert_eq!(response.error.unwrap().code, ErrorCode::ReadOnlyMode);
+        assert!(store.get_snapshot_meta("i-1").is_none());
     }
 
     #[test]

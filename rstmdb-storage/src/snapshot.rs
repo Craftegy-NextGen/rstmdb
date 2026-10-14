@@ -1,12 +1,13 @@
 //! Snapshot storage.
 
 use crate::error::StorageError;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rstmdb_core::instance::InstanceSnapshot;
+use rstmdb_core::{MachineRecord, RecoveryState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Snapshot policy configuration.
@@ -42,7 +43,44 @@ pub struct SnapshotStore {
     dir: PathBuf,
     /// In-memory index of snapshots by instance_id -> latest snapshot_id.
     index: RwLock<HashMap<String, SnapshotMeta>>,
+    /// Serializes mutations so index.json / machines.json writes never race.
+    write_lock: Mutex<()>,
 }
+
+const INDEX_FILE: &str = "index.json";
+const MACHINES_FILE: &str = "machines.json";
+
+/// Writes `data` to `path` atomically: temp file, fsync, rename, fsync dir.
+/// A crash leaves either the old or the new file, never a torn one.
+fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{}.tmp-{}", file_name, uuid::Uuid::new_v4()));
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    sync_dir(dir);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) {}
 
 impl SnapshotStore {
     /// Opens or creates a snapshot store at the given directory.
@@ -63,6 +101,7 @@ impl SnapshotStore {
         let store = Self {
             dir,
             index: RwLock::new(HashMap::new()),
+            write_lock: Mutex::new(()),
         };
 
         // Load existing snapshot index
@@ -73,7 +112,7 @@ impl SnapshotStore {
 
     /// Loads the snapshot index from disk.
     fn load_index(&self) -> Result<(), StorageError> {
-        let index_path = self.dir.join("index.json");
+        let index_path = self.dir.join(INDEX_FILE);
         if !index_path.exists() {
             return Ok(());
         }
@@ -88,11 +127,8 @@ impl SnapshotStore {
 
     /// Saves the snapshot index to disk.
     fn save_index(&self) -> Result<(), StorageError> {
-        let index_path = self.dir.join("index.json");
-        let file = File::create(&index_path)?;
-        let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, &*self.index.read())?;
-        Ok(())
+        let data = serde_json::to_vec_pretty(&*self.index.read())?;
+        atomic_write(&self.dir.join(INDEX_FILE), &data)
     }
 
     /// Creates a snapshot for an instance and persists it to disk.
@@ -123,11 +159,11 @@ impl SnapshotStore {
         let data = serde_json::to_vec_pretty(snapshot)?;
         let checksum = format!("{:08x}", crc32c::crc32c(&data));
 
+        let _guard = self.write_lock.lock();
+
         // Write snapshot file
         let snapshot_path = self.snapshot_path(&snapshot.snapshot_id);
-        let mut file = File::create(&snapshot_path)?;
-        file.write_all(&data)?;
-        file.sync_all()?;
+        atomic_write(&snapshot_path, &data)?;
 
         // Create metadata
         let meta = SnapshotMeta {
@@ -139,12 +175,18 @@ impl SnapshotStore {
             checksum,
         };
 
-        // Update index
-        {
+        // Update index; the superseded snapshot file is removed only after
+        // the new index is durable.
+        let previous = {
             let mut index = self.index.write();
-            index.insert(snapshot.instance_id.clone(), meta.clone());
-        }
+            index.insert(snapshot.instance_id.clone(), meta.clone())
+        };
         self.save_index()?;
+        if let Some(prev) = previous {
+            if prev.snapshot_id != meta.snapshot_id {
+                let _ = fs::remove_file(self.snapshot_path(&prev.snapshot_id));
+            }
+        }
 
         tracing::info!(
             "Created snapshot {} for instance {} at WAL offset {}",
@@ -214,6 +256,7 @@ impl SnapshotStore {
 
     /// Deletes a snapshot.
     pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
         let snapshot_path = self.snapshot_path(snapshot_id);
         if snapshot_path.exists() {
             fs::remove_file(&snapshot_path)?;
@@ -253,6 +296,51 @@ impl SnapshotStore {
             .filter(|id| !index.contains_key(*id))
             .cloned()
             .collect()
+    }
+
+    /// Persists all machine definitions (atomically replaces machines.json).
+    ///
+    /// Must be called before WAL compaction so definitions whose PUT_MACHINE
+    /// entries are compacted away can still be recovered.
+    pub fn save_machines(&self, machines: &[MachineRecord]) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock();
+        let data = serde_json::to_vec_pretty(machines)?;
+        atomic_write(&self.dir.join(MACHINES_FILE), &data)
+    }
+
+    /// Loads persisted machine definitions (empty if none were saved).
+    pub fn load_machines(&self) -> Result<Vec<MachineRecord>, StorageError> {
+        let path = self.dir.join(MACHINES_FILE);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&path)?;
+        Ok(serde_json::from_reader(BufReader::new(file))?)
+    }
+
+    /// Loads everything needed to recover the engine: persisted machines and
+    /// the latest snapshot of every indexed instance.
+    ///
+    /// Fails on any missing or corrupt snapshot rather than starting with
+    /// silently missing instances.
+    pub fn load_recovery_state(&self) -> Result<RecoveryState, StorageError> {
+        let machines = self.load_machines()?;
+        let metas: Vec<SnapshotMeta> = self.index.read().values().cloned().collect();
+        let mut snapshots = Vec::with_capacity(metas.len());
+        for meta in metas {
+            let snapshot = self.load_snapshot(&meta.snapshot_id)?;
+            if snapshot.instance_id != meta.instance_id {
+                return Err(StorageError::Corruption(format!(
+                    "snapshot {} belongs to {}, indexed under {}",
+                    meta.snapshot_id, snapshot.instance_id, meta.instance_id
+                )));
+            }
+            snapshots.push(snapshot);
+        }
+        Ok(RecoveryState {
+            machines,
+            snapshots,
+        })
     }
 
     fn snapshot_path(&self, snapshot_id: &str) -> PathBuf {
@@ -306,6 +394,61 @@ mod tests {
         let latest = store.get_latest_snapshot("i-1").unwrap().unwrap();
         assert_eq!(latest.snapshot_id, "snap-3");
         assert_eq!(latest.state, "state-3");
+    }
+
+    #[test]
+    fn test_superseded_snapshot_file_removed() {
+        let dir = TempDir::new().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        for i in 1..=2 {
+            let instance = Instance::new("i-1", "order", 1, "s", json!({}), i);
+            store
+                .create_snapshot(&InstanceSnapshot::from_instance(
+                    &instance,
+                    format!("snap-{}", i),
+                ))
+                .unwrap();
+        }
+        assert!(!dir.path().join("snap-1.snap").exists());
+        assert!(dir.path().join("snap-2.snap").exists());
+    }
+
+    #[test]
+    fn test_recovery_state_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = SnapshotStore::open(dir.path()).unwrap();
+            store
+                .save_machines(&[MachineRecord {
+                    machine: "order".into(),
+                    version: 1,
+                    definition: json!({"states": ["a"], "initial": "a", "transitions": []}),
+                }])
+                .unwrap();
+            let mut instance = Instance::new("i-1", "order", 1, "a", json!({}), 9);
+            instance.soft_delete(10);
+            store
+                .create_snapshot(&InstanceSnapshot::from_instance(&instance, "snap-x"))
+                .unwrap();
+        }
+        // Reopen: index and machines come back from disk.
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let state = store.load_recovery_state().unwrap();
+        assert_eq!(state.machines.len(), 1);
+        assert_eq!(state.snapshots.len(), 1);
+        assert!(state.snapshots[0].deleted);
+    }
+
+    #[test]
+    fn test_recovery_state_fails_on_corrupt_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let instance = Instance::new("i-1", "order", 1, "a", json!({}), 9);
+        store
+            .create_snapshot(&InstanceSnapshot::from_instance(&instance, "snap-1"))
+            .unwrap();
+        fs::write(dir.path().join("snap-1.snap"), b"{garbage").unwrap();
+        assert!(store.load_recovery_state().is_err());
     }
 
     #[test]

@@ -47,6 +47,11 @@ pub struct Instance {
 
     /// Last update timestamp (Unix millis).
     pub updated_at: i64,
+
+    /// Idempotency key used by the CREATE_INSTANCE request that created this
+    /// instance. A retry with the same key returns this instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_idempotency_key: Option<String>,
 }
 
 impl Instance {
@@ -87,6 +92,7 @@ impl Instance {
             last_wal_offset: wal_offset,
             created_at: now,
             updated_at: now,
+            create_idempotency_key: None,
         }
     }
 
@@ -143,7 +149,29 @@ impl Instance {
     }
 }
 
+/// A cached APPLY_EVENT result, persisted so idempotency survives restarts
+/// and WAL compaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    /// Idempotency key supplied by the client.
+    pub key: String,
+    /// State before the event.
+    pub from_state: String,
+    /// State after the event.
+    pub to_state: String,
+    /// Context after the event.
+    pub ctx: Value,
+    /// WAL offset of the original APPLY_EVENT.
+    pub wal_offset: u64,
+    /// WAL sequence of the original APPLY_EVENT.
+    #[serde(default)]
+    pub sequence: u64,
+}
+
 /// Snapshot of an instance at a point in time.
+///
+/// Fields added after the initial format use `#[serde(default)]` so older
+/// snapshot files remain readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceSnapshot {
     /// Snapshot ID.
@@ -169,6 +197,22 @@ pub struct InstanceSnapshot {
 
     /// Snapshot creation timestamp.
     pub created_at: i64,
+
+    /// Whether the instance was soft-deleted (tombstone snapshot).
+    #[serde(default)]
+    pub deleted: bool,
+
+    /// Last event ID applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<String>,
+
+    /// Idempotency key of the creating request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_idempotency_key: Option<String>,
+
+    /// Cached APPLY_EVENT results for this instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub idempotency: Vec<IdempotencyRecord>,
 }
 
 impl InstanceSnapshot {
@@ -186,7 +230,17 @@ impl InstanceSnapshot {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as i64,
+            deleted: instance.is_deleted(),
+            last_event_id: instance.last_event_id.clone(),
+            create_idempotency_key: instance.create_idempotency_key.clone(),
+            idempotency: Vec::new(),
         }
+    }
+
+    /// Attaches the instance's cached idempotency results.
+    pub fn with_idempotency(mut self, records: Vec<IdempotencyRecord>) -> Self {
+        self.idempotency = records;
+        self
     }
 
     /// Restores an instance from a snapshot.
@@ -197,11 +251,16 @@ impl InstanceSnapshot {
             version: self.version,
             state: self.state.clone(),
             ctx: self.ctx.clone(),
-            instance_state: InstanceState::Active,
-            last_event_id: None,
+            instance_state: if self.deleted {
+                InstanceState::Deleted
+            } else {
+                InstanceState::Active
+            },
+            last_event_id: self.last_event_id.clone(),
             last_wal_offset: self.wal_offset,
             created_at: self.created_at,
             updated_at: self.created_at,
+            create_idempotency_key: self.create_idempotency_key.clone(),
         }
     }
 }
@@ -253,5 +312,42 @@ mod tests {
         assert_eq!(restored.id, instance.id);
         assert_eq!(restored.state, instance.state);
         assert_eq!(restored.ctx, instance.ctx);
+    }
+
+    #[test]
+    fn test_snapshot_preserves_tombstone_event_id_and_keys() {
+        let mut instance = Instance::new("i-1", "order", 1, "paid", json!({}), 5);
+        instance.apply_transition("shipped", json!({}), Some("e-9".to_string()), 7);
+        instance.create_idempotency_key = Some("create-1".to_string());
+        instance.soft_delete(9);
+
+        let record = IdempotencyRecord {
+            key: "k".to_string(),
+            from_state: "paid".to_string(),
+            to_state: "shipped".to_string(),
+            ctx: json!({}),
+            wal_offset: 7,
+            sequence: 3,
+        };
+        let snapshot = InstanceSnapshot::from_instance(&instance, "snap-1")
+            .with_idempotency(vec![record.clone()]);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let decoded: InstanceSnapshot = serde_json::from_str(&json).unwrap();
+        let restored = decoded.to_instance();
+
+        assert!(restored.is_deleted());
+        assert_eq!(restored.last_event_id.as_deref(), Some("e-9"));
+        assert_eq!(restored.create_idempotency_key.as_deref(), Some("create-1"));
+        assert_eq!(decoded.idempotency, vec![record]);
+    }
+
+    #[test]
+    fn test_snapshot_reads_legacy_format() {
+        let legacy = r#"{"snapshot_id":"s","instance_id":"i","machine":"m","version":1,
+            "state":"a","ctx":{},"wal_offset":3,"created_at":0}"#;
+        let snapshot: InstanceSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(!snapshot.deleted);
+        assert!(snapshot.idempotency.is_empty());
+        assert!(snapshot.to_instance().is_active());
     }
 }

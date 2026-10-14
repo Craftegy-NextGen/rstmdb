@@ -224,10 +224,28 @@ impl Server {
         snapshot_dir: impl AsRef<Path>,
         auth_config: &AuthConfig,
     ) -> Result<Self, ServerError> {
+        let snapshot_store = Arc::new(rstmdb_storage::SnapshotStore::open(snapshot_dir)?);
+        Ok(Self::with_snapshot_store_and_auth(
+            config,
+            engine,
+            snapshot_store,
+            auth_config,
+        ))
+    }
+
+    /// Creates a new server sharing an already-open snapshot store (use the
+    /// same store for the compaction manager; see
+    /// [`CommandHandler::with_snapshot_store_and_auth`]).
+    pub fn with_snapshot_store_and_auth(
+        config: ServerConfig,
+        engine: Arc<StateMachineEngine>,
+        snapshot_store: Arc<rstmdb_storage::SnapshotStore>,
+        auth_config: &AuthConfig,
+    ) -> Self {
         let (shutdown_tx, _) = broadcast::channel(1);
         let broadcaster = Arc::new(EventBroadcaster::new(DEFAULT_BROADCAST_CAPACITY));
         let mut handler =
-            CommandHandler::with_snapshots_and_auth(engine, snapshot_dir, auth_config)?
+            CommandHandler::with_snapshot_store_and_auth(engine, snapshot_store, auth_config)
                 .with_broadcaster(broadcaster.clone())
                 .with_max_machine_versions(config.max_machine_versions)
                 .with_allow_flush_all(config.allow_flush_all)
@@ -235,7 +253,7 @@ impl Server {
         if let Some(ref metrics) = config.metrics {
             handler = handler.with_metrics(metrics.clone());
         }
-        Ok(Self {
+        Self {
             config,
             handler: Arc::new(handler),
             broadcaster,
@@ -243,7 +261,7 @@ impl Server {
             shutdown: shutdown_tx,
             running: AtomicBool::new(false),
             replication_manager: None,
-        })
+        }
     }
 
     /// Sets the replication manager (for primary mode). Plumbs the same Arc
