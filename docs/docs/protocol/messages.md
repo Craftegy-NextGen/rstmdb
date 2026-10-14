@@ -168,7 +168,7 @@ Sent asynchronously for active subscriptions. Event fields are **top-level** (no
     "wire_mode": "binary_json",
     "server_name": "rstmdb",
     "server_version": "0.1.1",
-    "features": ["idempotency", "batch", "wal_read"]
+    "features": ["idempotency", "durable_idempotency", "batch", "wal_read"]
   }
 }
 ```
@@ -279,7 +279,10 @@ Sent asynchronously for active subscriptions. Event fields are **top-level** (no
 ```
 
 - `instance_id` is optional — a UUID v4 is auto-generated if omitted.
-- `initial_ctx` is optional (defaults to `{}`).
+- `initial_ctx` is optional (omitted or `null` means `{}`); any other non-object value is
+  rejected with `BAD_REQUEST`.
+- Retrying with the same `idempotency_key` (same `instance_id`, machine and
+  version) returns the existing instance instead of `INSTANCE_EXISTS`.
 
 ### APPLY_EVENT
 
@@ -321,8 +324,14 @@ Sent asynchronously for active subscriptions. Event fields are **top-level** (no
 }
 ```
 
-- `applied: false` means the event was a duplicate idempotency key replay.
+- `applied: false` means the event was a duplicate idempotency key replay;
+  the response carries the original result and watchers are not notified again.
 - `expected_state` and `expected_wal_offset` enable optimistic concurrency.
+- The idempotency check runs first: a replay of a committed key returns its
+  original result even if `expected_*` no longer match.
+- Idempotency keys are scoped to the instance and are durable
+  (`durable_idempotency` feature): they survive restarts and WAL compaction.
+  Re-creating a deleted instance starts a fresh key scope.
 
 ### WATCH_ALL
 

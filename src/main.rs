@@ -240,14 +240,25 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .with_segment_size(config.storage.wal_segment_size())
         .with_fsync_policy(fsync_policy);
 
+    // Open the snapshot store first: recovery needs it. One store is shared
+    // by the command handler and the compaction manager.
+    let snapshot_store = Arc::new(SnapshotStore::open(&snapshot_dir)?);
+
+    // Recover: persisted machines + instance snapshots, then the remaining WAL.
+    // Replicas keep full-WAL replay: their in-memory offsets come from the
+    // primary while local WAL offsets differ, so snapshot coverage by offset
+    // is not meaningful there.
+    let recovery = if config.replication.is_replica() {
+        rstmdb_core::RecoveryState::default()
+    } else {
+        snapshot_store.load_recovery_state()?
+    };
+
     // Create state machine engine
     let engine = Arc::new(
-        StateMachineEngine::new(wal_config)?
+        StateMachineEngine::new_with_recovery(wal_config, recovery)?
             .with_allow_instance_recreate(config.storage.allow_instance_recreate),
     );
-
-    // Create snapshot store
-    let snapshot_store = Arc::new(SnapshotStore::open(&snapshot_dir)?);
 
     // Create metrics if enabled
     let (metrics, shutdown_tx) = if config.metrics.enabled {
@@ -272,12 +283,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref m) = metrics {
         server_config = server_config.with_metrics(m.clone());
     }
-    let mut server = Server::with_snapshots_and_auth(
+    let mut server = Server::with_snapshot_store_and_auth(
         server_config,
         engine.clone(),
-        &snapshot_dir,
+        snapshot_store.clone(),
         &config.auth,
-    )?;
+    );
 
     // Set up replication based on role
     let _replication_manager = if config.replication.is_primary() {
@@ -428,8 +439,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_compaction = compaction_manager.clone();
     let shutdown_metrics = shutdown_tx;
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Received shutdown signal, stopping server...");
+        let signal = shutdown_signal().await;
+        tracing::info!("Received {}, stopping server...", signal);
         shutdown_server.shutdown();
         shutdown_compaction.shutdown();
         if let Some(tx) = shutdown_metrics {
@@ -467,6 +478,40 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Server stopped");
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl+C) or, on Unix, SIGTERM — the signal container
+/// runtimes such as Kubernetes and Docker send before killing the process.
+/// Returns the signal name for logging.
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to listen for SIGINT: {}", e);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to listen for SIGTERM: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
+    }
 }
 
 // ===========================================================================

@@ -3,10 +3,11 @@
 use crate::definition::{MachineDefinition, State};
 use crate::error::CoreError;
 use crate::guard::GuardEvaluator;
-use crate::instance::Instance;
+use crate::instance::{IdempotencyRecord, Instance, InstanceSnapshot};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use rstmdb_wal::{Wal, WalConfig, WalEntry};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +23,26 @@ pub struct ApplyResult {
     pub applied: bool,
 }
 
+/// A persisted machine definition, used to recover definitions whose
+/// PUT_MACHINE WAL entries were removed by compaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MachineRecord {
+    pub machine: String,
+    pub version: u32,
+    pub definition: Value,
+}
+
+/// Durable state loaded from outside the WAL (snapshot store) at startup.
+///
+/// Recovery restores machines and instance snapshots first, then replays the
+/// remaining WAL, skipping instance entries already covered by a snapshot
+/// (`entry offset <= snapshot.wal_offset`).
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryState {
+    pub machines: Vec<MachineRecord>,
+    pub snapshots: Vec<InstanceSnapshot>,
+}
+
 /// The state machine engine.
 pub struct StateMachineEngine {
     /// Machine definitions indexed by (name, version).
@@ -30,8 +51,11 @@ pub struct StateMachineEngine {
     /// Instances indexed by ID.
     instances: DashMap<String, RwLock<Instance>>,
 
-    /// Idempotency cache: (instance_id, idempotency_key) -> result.
-    idempotency_cache: DashMap<(String, String), ApplyResult>,
+    /// Idempotency cache: instance_id -> (idempotency_key -> result).
+    ///
+    /// Rebuilt on startup from snapshots and WAL `idempotency_key`s, and
+    /// persisted in instance snapshots, so it survives restarts and compaction.
+    idempotency_cache: DashMap<String, HashMap<String, ApplyResult>>,
 
     /// Write-ahead log.
     wal: Arc<Wal>,
@@ -57,8 +81,20 @@ impl StateMachineEngine {
     /// assert_eq!(engine.instance_count(), 0);
     /// ```
     pub fn new(wal_config: WalConfig) -> Result<Self, CoreError> {
-        let wal = Arc::new(Wal::open(wal_config)?);
+        Self::new_with_recovery(wal_config, RecoveryState::default())
+    }
 
+    /// Opens the WAL and recovers state from `recovery` (snapshots and
+    /// persisted machine definitions) plus the remaining WAL entries.
+    pub fn new_with_recovery(
+        wal_config: WalConfig,
+        recovery: RecoveryState,
+    ) -> Result<Self, CoreError> {
+        Self::recover(Arc::new(Wal::open(wal_config)?), recovery)
+    }
+
+    /// Creates an engine over an existing WAL and recovers state.
+    pub fn recover(wal: Arc<Wal>, recovery: RecoveryState) -> Result<Self, CoreError> {
         let engine = Self {
             definitions: DashMap::new(),
             instances: DashMap::new(),
@@ -67,8 +103,7 @@ impl StateMachineEngine {
             allow_instance_recreate: true,
         };
 
-        // Replay WAL to restore state
-        engine.replay_wal()?;
+        engine.restore(recovery)?;
 
         Ok(engine)
     }
@@ -82,35 +117,83 @@ impl StateMachineEngine {
     /// Creates a new engine with an existing WAL.
     /// Replays WAL entries to restore state.
     pub fn with_wal(wal: Arc<Wal>) -> Result<Self, CoreError> {
-        let engine = Self {
-            definitions: DashMap::new(),
-            instances: DashMap::new(),
-            idempotency_cache: DashMap::new(),
-            wal,
-            allow_instance_recreate: true,
-        };
-
-        engine.replay_wal()?;
-
-        Ok(engine)
+        Self::recover(wal, RecoveryState::default())
     }
 
-    /// Replays all WAL entries to restore state.
-    fn replay_wal(&self) -> Result<(), CoreError> {
+    /// Restores persisted machines and snapshots, then replays the WAL.
+    fn restore(&self, recovery: RecoveryState) -> Result<(), CoreError> {
         use rstmdb_wal::WalOffset;
 
-        // Read all entries from the beginning
-        let entries = self.wal.read_from(WalOffset::from_u64(0), None)?;
-        let entry_count = entries.len();
-
-        for (_seq, offset, entry) in entries {
-            self.replay_entry(offset.as_u64(), entry)?;
+        let machine_count = recovery.machines.len();
+        for record in recovery.machines {
+            let key = (record.machine.clone(), record.version);
+            if !self.definitions.contains_key(&key) {
+                let def = MachineDefinition::from_json(
+                    &record.machine,
+                    record.version,
+                    &record.definition,
+                )?;
+                self.definitions.insert(key, Arc::new(def));
+            }
         }
 
-        if entry_count > 0 {
+        // Instance id -> WAL offset already reflected by its snapshot.
+        let mut covered: HashMap<String, u64> = HashMap::new();
+        let snapshot_count = recovery.snapshots.len();
+        for snapshot in recovery.snapshots {
+            covered.insert(snapshot.instance_id.clone(), snapshot.wal_offset);
+            if !snapshot.idempotency.is_empty() {
+                let cache = snapshot
+                    .idempotency
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.key.clone(),
+                            ApplyResult {
+                                from_state: r.from_state.clone(),
+                                to_state: r.to_state.clone(),
+                                ctx: r.ctx.clone(),
+                                wal_offset: r.wal_offset,
+                                sequence: r.sequence,
+                                applied: true,
+                            },
+                        )
+                    })
+                    .collect();
+                self.idempotency_cache
+                    .insert(snapshot.instance_id.clone(), cache);
+            }
+            let mut instance = snapshot.to_instance();
+            instance.ctx = normalize_ctx(instance.ctx).unwrap_or_else(empty_ctx);
+            self.instances
+                .insert(snapshot.instance_id.clone(), RwLock::new(instance));
+        }
+
+        let entries = self.wal.read_from(WalOffset::from_u64(0), None)?;
+        let entry_count = entries.len();
+        let mut skipped = 0usize;
+
+        for (seq, offset, entry) in entries {
+            let offset = offset.as_u64();
+            if let Some(id) = entry_instance_id(&entry) {
+                if covered
+                    .get(id)
+                    .is_some_and(|&snap_offset| offset <= snap_offset)
+                {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            self.replay_entry_at(seq, offset, entry)?;
+        }
+
+        if entry_count > 0 || snapshot_count > 0 || machine_count > 0 {
             tracing::info!(
-                "WAL replay complete: {} entries, {} machines, {} instances",
+                "Recovery complete: {} persisted machines, {} snapshots, {} WAL entries ({} covered by snapshots); {} machines, {} instances",
+                machine_count,
+                snapshot_count,
                 entry_count,
+                skipped,
                 self.definitions.len(),
                 self.instances.len()
             );
@@ -122,6 +205,15 @@ impl StateMachineEngine {
     /// Replays a single WAL entry to restore in-memory state.
     /// This is used during WAL recovery and replication.
     pub fn replay_entry(&self, offset: u64, entry: WalEntry) -> Result<(), CoreError> {
+        self.replay_entry_at(0, offset, entry)
+    }
+
+    fn replay_entry_at(
+        &self,
+        sequence: u64,
+        offset: u64,
+        entry: WalEntry,
+    ) -> Result<(), CoreError> {
         match entry {
             WalEntry::PutMachine {
                 machine,
@@ -163,14 +255,16 @@ impl StateMachineEngine {
                 version,
                 initial_state,
                 initial_ctx,
-                ..
+                idempotency_key,
             } => {
                 let should_create = match self.instances.get(&instance_id) {
                     None => true,
                     Some(existing) => existing.read().is_deleted(),
                 };
                 if should_create {
-                    let instance = Instance::new(
+                    // Older WALs may hold `null` contexts; heal them on replay.
+                    let initial_ctx = normalize_ctx(initial_ctx).unwrap_or_else(empty_ctx);
+                    let mut instance = Instance::new(
                         instance_id.clone(),
                         machine,
                         version,
@@ -178,6 +272,9 @@ impl StateMachineEngine {
                         initial_ctx,
                         offset,
                     );
+                    instance.create_idempotency_key = idempotency_key;
+                    // A (re)created instance starts with a fresh idempotency scope.
+                    self.idempotency_cache.remove(&instance_id);
                     self.instances
                         .insert(instance_id, parking_lot::RwLock::new(instance));
                 }
@@ -185,19 +282,36 @@ impl StateMachineEngine {
 
             WalEntry::ApplyEvent {
                 instance_id,
+                from_state,
                 to_state,
                 ctx,
                 event_id,
+                idempotency_key,
                 ..
             } => {
                 if let Some(instance_lock) = self.instances.get(&instance_id) {
                     let mut instance = instance_lock.write();
-                    instance.state = to_state;
-                    instance.ctx = ctx;
-                    instance.last_wal_offset = offset;
-                    if let Some(id) = event_id {
-                        instance.last_event_id = Some(id);
+                    if let Some(key) = idempotency_key {
+                        self.idempotency_cache
+                            .entry(instance_id.clone())
+                            .or_default()
+                            .insert(
+                                key,
+                                ApplyResult {
+                                    from_state,
+                                    to_state: to_state.clone(),
+                                    ctx: ctx.clone(),
+                                    wal_offset: offset,
+                                    sequence,
+                                    applied: true,
+                                },
+                            );
                     }
+                    instance.state = to_state;
+                    instance.ctx = normalize_ctx(ctx).unwrap_or_else(empty_ctx);
+                    instance.last_wal_offset = offset;
+                    // Mirror apply_transition: an event without an ID clears it.
+                    instance.last_event_id = event_id;
                 }
             }
 
@@ -393,13 +507,22 @@ impl StateMachineEngine {
         initial_ctx: Value,
         idempotency_key: Option<&str>,
     ) -> Result<(Instance, u64), CoreError> {
-        // Check idempotency
+        // The context is always a JSON object; an omitted/null initial_ctx
+        // means `{}` (anything else would make later payload merges no-ops).
+        let initial_ctx = normalize_ctx(initial_ctx).ok_or_else(|| CoreError::InvalidContext {
+            reason: "initial_ctx must be a JSON object".to_string(),
+        })?;
+
+        // Idempotent retry: the live instance was created by a request with
+        // the same key (and the same machine/version).
         if let Some(key) = idempotency_key {
-            let cache_key = (instance_id.to_string(), key.to_string());
-            if self.idempotency_cache.contains_key(&cache_key) {
-                // Already created, return existing
-                if let Some(instance_lock) = self.instances.get(instance_id) {
-                    let instance = instance_lock.read();
+            if let Some(instance_lock) = self.instances.get(instance_id) {
+                let instance = instance_lock.read();
+                if !instance.is_deleted()
+                    && instance.create_idempotency_key.as_deref() == Some(key)
+                    && instance.machine == machine
+                    && instance.version == version
+                {
                     return Ok((instance.clone(), instance.last_wal_offset));
                 }
             }
@@ -434,7 +557,7 @@ impl StateMachineEngine {
         let (sequence, offset) = self.wal.append(&entry)?;
 
         // Create instance
-        let instance = Instance::new(
+        let mut instance = Instance::new(
             instance_id,
             machine,
             version,
@@ -442,6 +565,10 @@ impl StateMachineEngine {
             initial_ctx,
             offset.as_u64(),
         );
+        instance.create_idempotency_key = idempotency_key.map(|s| s.to_string());
+
+        // A (re)created instance starts with a fresh idempotency scope.
+        self.idempotency_cache.remove(instance_id);
 
         // Store
         self.instances
@@ -508,14 +635,6 @@ impl StateMachineEngine {
         event_id: Option<&str>,
         idempotency_key: Option<&str>,
     ) -> Result<ApplyResult, CoreError> {
-        // Check idempotency cache
-        if let Some(key) = idempotency_key {
-            let cache_key = (instance_id.to_string(), key.to_string());
-            if let Some(result) = self.idempotency_cache.get(&cache_key) {
-                return Ok(result.clone());
-            }
-        }
-
         // Get instance (with write lock for the duration)
         let instance_lock =
             self.instances
@@ -525,6 +644,22 @@ impl StateMachineEngine {
                 })?;
 
         let mut instance = instance_lock.write();
+
+        // Check idempotency cache under the instance lock, so two concurrent
+        // requests with the same key cannot both apply. A replay reports
+        // `applied: false` (the event was not applied again).
+        if let Some(key) = idempotency_key {
+            if let Some(cached) = self
+                .idempotency_cache
+                .get(instance_id)
+                .and_then(|m| m.get(key).cloned())
+            {
+                return Ok(ApplyResult {
+                    applied: false,
+                    ..cached
+                });
+            }
+        }
 
         // Reject events on deleted instances
         if instance.is_deleted() {
@@ -613,8 +748,10 @@ impl StateMachineEngine {
 
         // Cache idempotency
         if let Some(key) = idempotency_key {
-            let cache_key = (instance_id.to_string(), key.to_string());
-            self.idempotency_cache.insert(cache_key, result.clone());
+            self.idempotency_cache
+                .entry(instance_id.to_string())
+                .or_default()
+                .insert(key.to_string(), result.clone());
         }
 
         Ok(result)
@@ -729,6 +866,57 @@ impl StateMachineEngine {
     }
 
     /// Returns the number of instances.
+    /// All instances, including soft-deleted ones (as tombstones), each with
+    /// its cached idempotency results, read consistently under the instance
+    /// lock. Used to build snapshots.
+    pub fn instances_for_snapshot(&self) -> Vec<(Instance, Vec<IdempotencyRecord>)> {
+        self.instances
+            .iter()
+            .map(|r| {
+                let instance = r.value().read();
+                let records = self.idempotency_records(&instance.id);
+                (instance.clone(), records)
+            })
+            .collect()
+    }
+
+    /// Cached idempotency results for one instance, ordered by WAL offset.
+    pub fn idempotency_records(&self, instance_id: &str) -> Vec<IdempotencyRecord> {
+        let mut records: Vec<IdempotencyRecord> = self
+            .idempotency_cache
+            .get(instance_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(key, r)| IdempotencyRecord {
+                        key: key.clone(),
+                        from_state: r.from_state.clone(),
+                        to_state: r.to_state.clone(),
+                        ctx: r.ctx.clone(),
+                        wal_offset: r.wal_offset,
+                        sequence: r.sequence,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        records.sort_by(|a, b| a.wal_offset.cmp(&b.wal_offset).then(a.key.cmp(&b.key)));
+        records
+    }
+
+    /// All machine definitions, for persisting alongside snapshots.
+    pub fn machine_records(&self) -> Result<Vec<MachineRecord>, CoreError> {
+        let mut records = Vec::with_capacity(self.definitions.len());
+        for entry in self.definitions.iter() {
+            let (machine, version) = entry.key();
+            records.push(MachineRecord {
+                machine: machine.clone(),
+                version: *version,
+                definition: serde_json::to_value(&entry.value().raw)?,
+            });
+        }
+        records.sort_by(|a, b| a.machine.cmp(&b.machine).then(a.version.cmp(&b.version)));
+        Ok(records)
+    }
+
     pub fn instance_count(&self) -> usize {
         self.instances.len()
     }
@@ -750,6 +938,28 @@ impl StateMachineEngine {
 }
 
 /// Merges payload into context.
+fn empty_ctx() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+/// `null` -> `{}`, objects unchanged, anything else -> `None` (invalid).
+fn normalize_ctx(ctx: Value) -> Option<Value> {
+    match ctx {
+        Value::Null => Some(empty_ctx()),
+        Value::Object(_) => Some(ctx),
+        _ => None,
+    }
+}
+
+fn entry_instance_id(entry: &WalEntry) -> Option<&str> {
+    match entry {
+        WalEntry::CreateInstance { instance_id, .. }
+        | WalEntry::ApplyEvent { instance_id, .. }
+        | WalEntry::DeleteInstance { instance_id, .. } => Some(instance_id),
+        _ => None,
+    }
+}
+
 fn merge_ctx(ctx: &Value, payload: &Value) -> Value {
     match (ctx, payload) {
         (Value::Object(ctx_map), Value::Object(payload_map)) => {
@@ -961,6 +1171,305 @@ mod tests {
 
         assert_eq!(result1.wal_offset, result2.wal_offset);
         assert_eq!(result1.to_state, result2.to_state);
+    }
+
+    // =========================================================================
+    // Context Normalization Tests
+    // =========================================================================
+
+    #[test]
+    fn test_null_initial_ctx_becomes_empty_object() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        let (instance, _) = engine
+            .create_instance("i-1", "order", 1, Value::Null, None)
+            .unwrap();
+        assert_eq!(instance.ctx, json!({}));
+
+        // Payloads merge (previously a null ctx silently dropped them).
+        engine
+            .apply_event(
+                "i-1",
+                "PAY",
+                json!({"items_ready": true}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.get_instance("i-1").unwrap().ctx,
+            json!({"items_ready": true})
+        );
+        drop(engine);
+
+        let engine = reopen(&dir);
+        assert_eq!(
+            engine.get_instance("i-1").unwrap().ctx,
+            json!({"items_ready": true})
+        );
+    }
+
+    #[test]
+    fn test_non_object_initial_ctx_rejected() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        for bad in [json!([1, 2]), json!("x"), json!(3)] {
+            let err = engine
+                .create_instance("i-1", "order", 1, bad, None)
+                .unwrap_err();
+            assert_eq!(err.error_code(), "BAD_REQUEST");
+        }
+    }
+
+    #[test]
+    fn test_replay_heals_legacy_null_ctx() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        // Simulate a WAL written by an older server that stored `null`.
+        engine
+            .wal()
+            .append(&WalEntry::CreateInstance {
+                instance_id: "legacy".to_string(),
+                machine: "order".to_string(),
+                version: 1,
+                initial_state: "created".to_string(),
+                initial_ctx: Value::Null,
+                idempotency_key: None,
+            })
+            .unwrap();
+        drop(engine);
+
+        let engine = reopen(&dir);
+        assert_eq!(engine.get_instance("legacy").unwrap().ctx, json!({}));
+        engine
+            .apply_event("legacy", "PAY", json!({"a": 1}), None, None, None, None)
+            .unwrap();
+        assert_eq!(engine.get_instance("legacy").unwrap().ctx, json!({"a": 1}));
+    }
+
+    // =========================================================================
+    // Durable Idempotency Tests
+    // =========================================================================
+
+    fn reopen(dir: &TempDir) -> StateMachineEngine {
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        StateMachineEngine::new(config).unwrap()
+    }
+
+    #[test]
+    fn test_idempotent_replay_reports_not_applied() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+
+        let first = engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("k"))
+            .unwrap();
+        let replay = engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("k"))
+            .unwrap();
+
+        assert!(first.applied);
+        assert!(!replay.applied);
+        assert_eq!(first.wal_offset, replay.wal_offset);
+        assert_eq!(engine.get_instance("i-1").unwrap().state, "paid");
+    }
+
+    #[test]
+    fn test_apply_idempotency_survives_restart() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+        let first = engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("pay-1"))
+            .unwrap();
+        drop(engine);
+
+        let engine = reopen(&dir);
+        let retry = engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("pay-1"))
+            .unwrap();
+
+        assert!(!retry.applied, "retry after restart must not re-apply");
+        assert_eq!(retry.wal_offset, first.wal_offset);
+        assert_eq!(retry.to_state, "paid");
+        assert_eq!(engine.get_instance("i-1").unwrap().state, "paid");
+    }
+
+    #[test]
+    fn test_create_idempotency() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        let (created, _) = engine
+            .create_instance("i-1", "order", 1, json!({"a": 1}), Some("create-1"))
+            .unwrap();
+
+        // Same key: returns the existing instance.
+        let (again, _) = engine
+            .create_instance("i-1", "order", 1, json!({"a": 1}), Some("create-1"))
+            .unwrap();
+        assert_eq!(again.last_wal_offset, created.last_wal_offset);
+
+        // Different key, or no key: still a conflict.
+        assert!(matches!(
+            engine.create_instance("i-1", "order", 1, json!({}), Some("other")),
+            Err(CoreError::InstanceExists { .. })
+        ));
+        assert!(matches!(
+            engine.create_instance("i-1", "order", 1, json!({}), None),
+            Err(CoreError::InstanceExists { .. })
+        ));
+        drop(engine);
+
+        // Survives restart.
+        let engine = reopen(&dir);
+        let (after, _) = engine
+            .create_instance("i-1", "order", 1, json!({"a": 1}), Some("create-1"))
+            .unwrap();
+        assert_eq!(after.last_wal_offset, created.last_wal_offset);
+    }
+
+    #[test]
+    fn test_recreated_instance_gets_fresh_idempotency_scope() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+        engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("k"))
+            .unwrap();
+        engine.delete_instance("i-1", None).unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+
+        let r = engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("k"))
+            .unwrap();
+        assert!(r.applied, "key from the deleted incarnation must not match");
+        drop(engine);
+
+        // Replay must reach the same conclusion.
+        let engine = reopen(&dir);
+        let r = engine
+            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("k"))
+            .unwrap();
+        assert!(!r.applied);
+    }
+
+    #[test]
+    fn test_concurrent_same_key_applies_once() {
+        let (_dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+        let engine = Arc::new(engine);
+
+        let applied: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let engine = engine.clone();
+                    s.spawn(move || {
+                        engine
+                            .apply_event("i-1", "PAY", json!({}), None, None, None, Some("same"))
+                            .map(|r| r.applied)
+                            .unwrap_or(false)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap() as usize)
+                .sum()
+        });
+
+        assert_eq!(applied, 1);
+        assert_eq!(engine.get_instance("i-1").unwrap().state, "paid");
+    }
+
+    #[test]
+    fn test_recovery_from_snapshots_skips_covered_entries() {
+        let (dir, engine) = test_engine();
+        engine
+            .put_machine("order", 1, &sample_definition())
+            .unwrap();
+        engine
+            .create_instance("i-1", "order", 1, json!({}), None)
+            .unwrap();
+        engine
+            .apply_event(
+                "i-1",
+                "PAY",
+                json!({"items_ready": true}),
+                None,
+                None,
+                Some("e-1"),
+                Some("pay"),
+            )
+            .unwrap();
+
+        // Snapshot at the current state, then advance past it.
+        let (instance, records) = engine
+            .instances_for_snapshot()
+            .into_iter()
+            .find(|(i, _)| i.id == "i-1")
+            .unwrap();
+        let snapshot = InstanceSnapshot::from_instance(&instance, "s").with_idempotency(records);
+        let machines = engine.machine_records().unwrap();
+        engine
+            .apply_event("i-1", "SHIP", json!({}), None, None, None, Some("ship"))
+            .unwrap();
+        drop(engine);
+
+        let config = WalConfig::new(dir.path())
+            .with_segment_size(4096)
+            .with_fsync_policy(FsyncPolicy::EveryWrite);
+        let engine = StateMachineEngine::new_with_recovery(
+            config,
+            RecoveryState {
+                machines,
+                snapshots: vec![snapshot],
+            },
+        )
+        .unwrap();
+
+        let i = engine.get_instance("i-1").unwrap();
+        assert_eq!(i.state, "shipped");
+        // SHIP carried no event_id, so (as in live apply) it cleared e-1.
+        assert_eq!(i.last_event_id, None);
+        for key in ["pay", "ship"] {
+            let event = if key == "pay" { "PAY" } else { "SHIP" };
+            let r = engine
+                .apply_event("i-1", event, json!({}), None, None, None, Some(key))
+                .unwrap();
+            assert!(!r.applied, "{key} must be remembered");
+        }
     }
 
     // =========================================================================
