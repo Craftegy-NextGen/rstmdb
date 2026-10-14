@@ -358,6 +358,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          # Only our build outputs. docker/build-push-action also uploads a
+          # `*.dockerbuild` build record, which download-artifact fails on.
+          pattern: "{linux,deb,rpm,macos,windows}-*"
 
       - name: Prepare release assets
         run: |
