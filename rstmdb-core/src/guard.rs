@@ -431,7 +431,9 @@ impl<'a> Parser<'a> {
     }
 
     fn peek_str(&self, s: &str) -> bool {
-        self.input.get(self.pos..).is_some_and(|rest| rest.starts_with(s))
+        self.input
+            .get(self.pos..)
+            .is_some_and(|rest| rest.starts_with(s))
     }
 }
 
