@@ -6,7 +6,7 @@ sidebar_position: 11
 
 Planned features and development phases for rstmdb.
 
-## Current Version: 0.2.x
+## Current Version: 0.3.x
 
 ### Core Features (Complete)
 
@@ -85,7 +85,7 @@ Enable read replicas for horizontal read scaling and improved availability.
 - [x] Replica lag monitoring (entries and seconds)
 - [x] Per-replica primary-side metrics
 - [x] Replication metrics (Prometheus) + Grafana dashboard
-- [ ] Health check endpoints
+- [x] Health check endpoints (`/health`, `/healthz`)
 
 ### Failover Support
 
@@ -128,6 +128,7 @@ Production-ready operational features.
 
 ### Recovery
 
+- [x] Backup and restore (`.rstmbak`), including hot backup on a running server
 - [ ] Point-in-time recovery
 - [ ] Incremental backups
 - [ ] Cross-region replication
@@ -198,7 +199,7 @@ See [CONTRIBUTING.md](https://github.com/rstmdb/rstmdb/blob/main/CONTRIBUTING.md
 | Version | Target   | Focus                                             |
 | ------- | -------- | ------------------------------------------------- |
 | 0.2.0   | Released | Client libraries, FLUSH_ALL, instance re-creation |
-| 0.3.0   | Released | WAL streaming replication                         |
+| 0.3.0   | Released | WAL streaming replication, backup and restore     |
 | 0.4.0   | Q3 2026  | Failover tooling, Raft consensus                  |
 | 1.0.0   | Q4 2026  | Production ready                                  |
 
