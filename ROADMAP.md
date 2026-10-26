@@ -1,6 +1,6 @@
 # rstmdb Roadmap
 
-## Current Features (v0.1.0)
+## Current Features (v0.3.0)
 
 ### Core
 
@@ -17,7 +17,19 @@
 - **Configurable fsync** - Trade-off between durability and performance (every_write, every_n, every_ms, never)
 - **Per-instance snapshots** - Point-in-time state capture
 - **Automatic compaction** - Background WAL cleanup based on thresholds
-- **Crash recovery** - Full state reconstruction from WAL on startup
+- **Crash recovery** - Startup restores persisted machines and instance snapshots, then replays the remaining WAL
+
+### Replication
+
+- **WAL streaming** - Primary streams WAL entries to replicas, in async or sync mode
+- **Read-only replicas** - Replicas serve reads and reject writes, with offset-based catch-up
+- **Lag thresholds** - `max_lag_seconds` and `max_lag_entries`, with per-replica metrics
+- **Replication auth** - Hashed replication tokens with rotation
+
+### Backup and Restore
+
+- **Offline backup** - `rstmdb backup`, `rstmdb restore` and `rstmdb verify` with the `.rstmbak` format
+- **Hot backup** - `BACKUP_BEGIN`, `BACKUP_CHUNK` and `BACKUP_END` protocol operations on a running server
 
 ### Networking
 
@@ -36,11 +48,13 @@
 
 - **Prometheus metrics** - Request counts, latencies, WAL stats, connection gauges
 - **Grafana dashboard** - Pre-built visualizations
-- **Structured logging** - JSON-formatted logs for aggregation
+- **Health endpoints** - `/health` and `/healthz` on the metrics server
+- **Logging** - `tracing` output, filtered with `RUST_LOG`
 
 ### Tooling
 
 - **Rust client library** - Async API with connection management
+- **Client libraries** - [Python](https://github.com/rstmdb/rstmdb-py), [JavaScript/TypeScript](https://github.com/rstmdb/rstmdb-js), [Go](https://github.com/rstmdb/rstmdb-go), [Java](https://github.com/rstmdb/rstmdb-java) and [.NET](https://github.com/rstmdb/rstmdb-dotnet), each in its own repository
 - **CLI with REPL** - Interactive shell for administration
 - **Docker support** - Container images and compose files
 - **Load testing** - Configurable benchmark scripts
@@ -53,17 +67,19 @@
 
 Expand ecosystem with official client libraries:
 
-- [x] **Python client** - Specification exists, implementation pending
-- [x] **TypeScript/Node.js client** - For JavaScript ecosystems
-- [ ] **Go client** - Native Go implementation
+- [x] **Python client** - [rstmdb-py](https://github.com/rstmdb/rstmdb-py)
+- [x] **TypeScript/Node.js client** - [rstmdb-js](https://github.com/rstmdb/rstmdb-js)
+- [x] **Go client** - [rstmdb-go](https://github.com/rstmdb/rstmdb-go)
+- [x] **Java client** - [rstmdb-java](https://github.com/rstmdb/rstmdb-java)
+- [x] **.NET client** - [rstmdb-dotnet](https://github.com/rstmdb/rstmdb-dotnet)
 
 ### Phase 2: High Availability
 
 Enable read scaling and fault tolerance without consensus:
 
-- [ ] **WAL streaming to replicas** - Real-time log shipping
-- [ ] **Read-only follower mode** - Serve reads from replicas
-- [ ] **Health checks** - Replica lag monitoring and alerts
+- [x] **WAL streaming to replicas** - Real-time log shipping
+- [x] **Read-only follower mode** - Serve reads from replicas
+- [x] **Health checks** - Replica lag monitoring and alerts
 - [ ] **External failover orchestration** - Integration with orchestrators (Kubernetes, Consul)
 
 ### Phase 3: Consensus & Automatic Failover
@@ -115,7 +131,7 @@ These are explicitly out of scope for rstmdb:
 
 We welcome contributions. Areas where help is especially appreciated:
 
-1. **Client libraries** - Python, Go, TypeScript implementations
+1. **Client libraries** - Improvements to the existing clients and additional languages
 2. **Documentation** - Tutorials, examples, API reference improvements
 3. **Testing** - Chaos testing, fuzz testing, load testing
 4. **Integrations** - Kubernetes operators, Terraform providers
@@ -128,7 +144,10 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines.
 
 | Version | Date | Highlights |
 |---------|------|------------|
-| 0.1.0 | Current | Initial release with core features |
+| 0.3.0 | 2026-10-14 | WAL streaming replication, backup and restore, hot backup, durable idempotency |
+| 0.2.0 | 2026-03-18 | Client libraries, FLUSH_ALL, instance re-creation |
+| 0.1.1 | 2026-02-07 | Instance listing with filtering and pagination, BSL-1.1 license |
+| 0.1.0 | 2026-02-01 | Initial release with core features |
 
 ---
 
